@@ -2,11 +2,12 @@
 // @author 
 // @description 弹幕：支持
 // @dependencies: axios
-// @version 1.1.0
+// @version 1.1.1
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/综合/哔哩大全.js
 
 /**
  * 哔哩大全 - OmniBox 爬虫脚本（模板化版本）
+ * v1.1.2 修复分类切换问题，添加封面缓存机制
  */
 const axios = require("axios");
 const OmniBox = require("omnibox_sdk");
@@ -23,6 +24,9 @@ const BILI_HEADERS = {
 };
 
 const isLoggedIn = () => Boolean(BILI_COOKIE && BILI_COOKIE.includes("SESSDATA="));
+
+// 封面缓存
+const coverCache = new Map();
 
 const CLASSES = [
   { type_id: "沙雕仙逆", type_name: "傻屌仙逆" },
@@ -92,10 +96,74 @@ function logError(msg, err) {
   OmniBox.log("error", `[BILI-ALL] ${msg}: ${err?.message || err}`);
 }
 
-function fixCover(url) {
-  if (!url) return "";
-  if (url.startsWith("//")) return `https:${url}`;
-  return url;
+/**
+ * 下载图片并转换为Base64（带缓存）
+ */
+async function downloadImageAsBase64(url) {
+  if (!url) return '';
+  
+  // 检查缓存
+  if (coverCache.has(url)) {
+    logInfo(`downloadImageAsBase64: 使用缓存 ${url}`);
+    return coverCache.get(url);
+  }
+  
+  try {
+    logInfo(`downloadImageAsBase64: 下载图片 ${url}`);
+    
+    const response = await axios.get(url, {
+      headers: {
+        'User-Agent': BILI_HEADERS['User-Agent'],
+        'Referer': 'https://www.bilibili.com',
+        'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Connection': 'keep-alive',
+      },
+      responseType: 'arraybuffer',
+      timeout: 10000
+    });
+    
+    if (response.status === 200 && response.data) {
+      const contentType = response.headers['content-type'] || 'image/jpeg';
+      const base64 = Buffer.from(response.data, 'binary').toString('base64');
+      const dataUrl = `data:${contentType};base64,${base64}`;
+      logInfo(`downloadImageAsBase64: 成功转换为Base64，大小: ${base64.length} 字符`);
+      
+      // 存入缓存
+      coverCache.set(url, dataUrl);
+      
+      return dataUrl;
+    }
+  } catch (error) {
+    logInfo(`downloadImageAsBase64: 下载失败 ${error.message}`);
+  }
+  
+  return '';
+}
+
+/**
+ * 获取B站视频封面（转换为Base64）
+ */
+async function getCoverBase64(picUrl) {
+  if (!picUrl) return '';
+  
+  try {
+    // 修复URL格式
+    let fullUrl = picUrl;
+    if (picUrl.startsWith("//")) {
+      fullUrl = `https:${picUrl}`;
+    }
+    
+    logInfo(`getCoverBase64: 获取封面: ${fullUrl}`);
+    const base64 = await downloadImageAsBase64(fullUrl);
+    if (base64) {
+      return base64;
+    }
+  } catch (error) {
+    logInfo(`getCoverBase64: 转换失败: ${error.message}`);
+  }
+  
+  return '';
 }
 
 function formatDuration(seconds) {
@@ -236,15 +304,27 @@ async function matchDanmu(fileName, cid) {
 
 async function home(params) {
   try {
+    logInfo("获取首页数据...");
+    
     const url = "https://api.bilibili.com/x/web-interface/popular?ps=20&pn=1";
     const { data } = await axios.get(url, { headers: BILI_HEADERS });
 
-    const list = (data?.data?.list || []).map((item) => ({
-      vod_id: String(item.aid || ""),
-      vod_name: String(item.title || "").replace(/<[^>]*>/g, ""),
-      vod_pic: fixCover(item.pic),
-      vod_remarks: formatDuration(item.duration),
-    }));
+    const items = data?.data?.list || [];
+    logInfo(`首页获取到 ${items.length} 个视频`);
+    
+    // 并行处理封面转换（带缓存）
+    const promises = items.map(async (item) => {
+      const coverBase64 = await getCoverBase64(item.pic);
+      return {
+        vod_id: String(item.aid || ""),
+        vod_name: String(item.title || "").replace(/<[^>]*>/g, ""),
+        vod_pic: coverBase64 || '',
+        vod_remarks: formatDuration(item.duration),
+      };
+    });
+    
+    const list = await Promise.all(promises);
+    logInfo(`首页返回 ${list.length} 个视频，其中 ${list.filter(v => v.vod_pic).length} 个有封面`);
 
     return {
       class: CLASSES,
@@ -259,28 +339,52 @@ async function home(params) {
 async function category(params) {
   const keyword = params.categoryId || "";
   const page = Math.max(1, parseInt(params.page, 10) || 1);
+  
   if (!keyword) {
+    logInfo("分类关键词为空");
     return { page: 1, pagecount: 0, total: 0, list: [] };
   }
 
   try {
+    logInfo(`分类获取: 关键词=${keyword}, 页码=${page}`);
+    
     const { data } = await axios.get("https://api.bilibili.com/x/web-interface/search/type", {
       headers: BILI_HEADERS,
       params: {
         search_type: "video",
         keyword,
         page,
+        pagesize: 20
       },
+      timeout: 10000
     });
 
-    const list = (data?.data?.result || [])
-      .filter((item) => item.type === "video")
-      .map((item) => ({
+    if (data?.code !== 0) {
+      logError(`分类API返回错误: ${data?.code}`);
+      return { page, pagecount: 0, total: 0, list: [] };
+    }
+
+    const items = (data?.data?.result || []).filter((item) => item.type === "video");
+    logInfo(`分类获取到 ${items.length} 个视频`);
+    
+    if (items.length === 0) {
+      logInfo(`分类 "${keyword}" 没有找到视频`);
+      return { page, pagecount: 0, total: 0, list: [] };
+    }
+    
+    // 并行处理封面转换（带缓存）
+    const promises = items.map(async (item) => {
+      const coverBase64 = await getCoverBase64(item.pic);
+      return {
         vod_id: String(item.aid || ""),
         vod_name: String(item.title || "").replace(/<[^>]*>/g, ""),
-        vod_pic: fixCover(item.pic),
+        vod_pic: coverBase64 || '',
         vod_remarks: formatSearchDuration(item.duration),
-      }));
+      };
+    });
+    
+    const list = await Promise.all(promises);
+    logInfo(`分类返回 ${list.length} 个视频，其中 ${list.filter(v => v.vod_pic).length} 个有封面`);
 
     return {
       page,
@@ -295,10 +399,65 @@ async function category(params) {
 }
 
 async function search(params) {
-  return category({
-    categoryId: params.keyword || params.wd || "",
-    page: params.page,
-  });
+  const keyword = params.keyword || params.wd || "";
+  const page = Math.max(1, parseInt(params.page, 10) || 1);
+  
+  if (!keyword) {
+    logInfo("搜索关键词为空");
+    return { page: 1, pagecount: 0, total: 0, list: [] };
+  }
+  
+  try {
+    logInfo(`搜索: 关键词=${keyword}, 页码=${page}`);
+    
+    const { data } = await axios.get("https://api.bilibili.com/x/web-interface/search/type", {
+      headers: BILI_HEADERS,
+      params: {
+        search_type: "video",
+        keyword,
+        page,
+        pagesize: 20
+      },
+      timeout: 10000
+    });
+
+    if (data?.code !== 0) {
+      logError(`搜索API返回错误: ${data?.code}`);
+      return { page, pagecount: 0, total: 0, list: [] };
+    }
+
+    const items = (data?.data?.result || []).filter((item) => item.type === "video");
+    logInfo(`搜索到 ${items.length} 个视频`);
+    
+    if (items.length === 0) {
+      logInfo(`搜索 "${keyword}" 没有找到视频`);
+      return { page, pagecount: 0, total: 0, list: [] };
+    }
+    
+    // 并行处理封面转换（带缓存）
+    const promises = items.map(async (item) => {
+      const coverBase64 = await getCoverBase64(item.pic);
+      return {
+        vod_id: String(item.aid || ""),
+        vod_name: String(item.title || "").replace(/<[^>]*>/g, ""),
+        vod_pic: coverBase64 || '',
+        vod_remarks: formatSearchDuration(item.duration),
+      };
+    });
+    
+    const list = await Promise.all(promises);
+    logInfo(`搜索返回 ${list.length} 个视频，其中 ${list.filter(v => v.vod_pic).length} 个有封面`);
+
+    return {
+      page,
+      pagecount: data?.data?.numPages || 1,
+      total: data?.data?.numResults || list.length,
+      list,
+    };
+  } catch (error) {
+    logError("搜索失败", error);
+    return { page, pagecount: 0, total: 0, list: [] };
+  }
 }
 
 async function detail(params) {
@@ -306,12 +465,23 @@ async function detail(params) {
   if (!videoId) return { list: [] };
 
   try {
+    logInfo(`获取详情: videoId=${videoId}`);
+    
     const { data } = await axios.get(`https://api.bilibili.com/x/web-interface/view?aid=${videoId}`, {
       headers: BILI_HEADERS,
+      timeout: 10000
     });
+
+    if (data?.code !== 0) {
+      logError(`详情API返回错误: ${data?.code}`);
+      return { list: [] };
+    }
 
     const video = data?.data;
     if (!video) return { list: [] };
+
+    const coverBase64 = await getCoverBase64(video.pic);
+    logInfo(`详情封面转换完成: ${coverBase64 ? '成功' : '失败'}`);
 
     const episodes = (video.pages || []).map((p, i) => {
       const part = p.part || `第${i + 1}集`;
@@ -326,7 +496,7 @@ async function detail(params) {
         {
           vod_id: String(videoId),
           vod_name: String(video.title || "").replace(/<[^>]*>/g, ""),
-          vod_pic: fixCover(video.pic),
+          vod_pic: coverBase64 || '',
           vod_content: String(video.desc || ""),
           vod_play_sources: [
             {
@@ -401,6 +571,7 @@ async function play(params) {
           fourk: qn >= 120 ? 1 : 0,
           ...(!loggedIn ? { try_look: 1 } : {}),
         },
+        timeout: 10000
       });
 
       if (data?.code !== 0 || !data?.data) continue;
